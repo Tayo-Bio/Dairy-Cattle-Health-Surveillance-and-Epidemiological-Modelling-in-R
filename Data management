@@ -1,0 +1,93 @@
+suppressMessages({
+  library(dplyr)
+  library(data.table)
+})
+
+herd     <- read.csv("C:/Users/HP/Documents/Cow_control_project/cowcontrol_pipeline/cowcontrol/data/herd.csv")
+cow      <- read.csv("C:/Users/HP/Documents/Cow_control_project/cowcontrol_pipeline/cowcontrol/data/cow.csv")
+lactation<- read.csv("C:/Users/HP/Documents/Cow_control_project/cowcontrol_pipeline/cowcontrol/data/lactation.csv", stringsAsFactors = FALSE)
+testday  <- read.csv("C:/Users/HP/Documents/Cow_control_project/cowcontrol_pipeline/cowcontrol/data/testday.csv",   stringsAsFactors = FALSE)
+
+
+lactation$calving_date <- as.Date(lactation$calving_date)
+lactation$dry_off_date <- as.Date(lactation$dry_off_date)
+testday$test_date      <- as.Date(testday$test_date)
+
+# Data-quality screen 
+qc_flags <- testday %>%
+  mutate(
+    qc_yield_out_of_range = milk_yield_kg < 2 | milk_yield_kg > 70,
+    qc_fat_out_of_range    = fat_pct < 2.0 | fat_pct > 8.0,
+    qc_protein_out_of_range= protein_pct < 2.0 | protein_pct > 6.0,
+    qc_scc_out_of_range    = scc_cells_ml < 1000 | scc_cells_ml > 9999000,
+    qc_dim_out_of_range    = dim < 0 | dim > 400
+  )
+n_flagged <- qc_flags %>%
+  summarise(across(starts_with("qc_"), sum)) 
+
+#Merge into one long analysis table
+df <- testday %>%
+  left_join(cow %>% select(-herd_id), by = "cow_id") %>%
+  left_join(herd,      by = "herd_id") %>%
+  left_join(lactation %>% select(lact_id, calving_date, dry_off_date,
+                                  calving_interval_days, culled_this_lactation,
+                                  cull_reason),
+            by = "lact_id")
+glimpse(df)
+
+#Derived variables
+df <- df %>%
+  mutate(
+    #Somatic cell score: standard log2 transform used because SCC is
+    #strongly right-skewed / log-normal 
+    scs = log2(scc_cells_ml / 100000) + 3,
+
+    ## lactation stage classification
+    lact_stage = case_when(
+      dim <= 30  ~ "Early (<=30 DIM)",
+      dim <= 100 ~ "Peak (31-100 DIM)",
+      dim <= 200 ~ "Mid (101-200 DIM)",
+      TRUE       ~ "Late (>200 DIM)"
+    ),
+
+    #season of test date
+    season = case_when(
+      format(test_date, "%m") %in% c("12","01","02") ~ "Winter",
+      format(test_date, "%m") %in% c("03","04","05") ~ "Spring",
+      format(test_date, "%m") %in% c("06","07","08") ~ "Summer",
+      TRUE ~ "Autumn"
+    ),
+    high_scc_flag = scc_cells_ml >= 200000,
+
+    parity_group = ifelse(parity == 1, "Primiparous", "Multiparous")
+  )
+
+#Cow/lactation-level summary table (one row per lactation)
+lact_summary <- df %>%
+  group_by(lact_id, cow_id, herd_id, breed, parity, region, system) %>%
+  summarise(
+    n_test_days      = n(),
+    mean_milk_yield  = mean(milk_yield_kg, na.rm = TRUE),
+    peak_yield       = max(milk_yield_kg, na.rm = TRUE),
+    mean_fat_pct     = mean(fat_pct, na.rm = TRUE),
+    mean_protein_pct = mean(protein_pct, na.rm = TRUE),
+    mean_scs         = mean(scs, na.rm = TRUE),
+    max_scc          = max(scc_cells_ml, na.rm = TRUE),
+    any_high_scc     = any(high_scc_flag),
+    any_clinical_mastitis = any(clinical_mastitis_flag == "True" | clinical_mastitis_flag == TRUE),
+    culled           = first(culled_this_lactation),
+    cull_reason      = first(cull_reason),
+    calving_interval_days = first(calving_interval_days),
+    .groups = "drop"
+  )
+
+## time-to-cull variable for survival analysis: days from calving to
+## dry-off/end of lactation (proxy for "time at risk" in this synthetic set)
+lact_dates <- lactation %>% mutate(days_in_lactation = as.numeric(dry_off_date - calving_date))
+lact_summary <- lact_summary %>% left_join(lact_dates %>% select(lact_id, days_in_lactation), by = "lact_id")
+
+# Write outputs
+dir.create("C:/Users/HP/Documents/Cow_control_project/cowcontrol_pipeline/cowcontrol/data/outputs/tables", recursive = TRUE, showWarnings = FALSE)
+fwrite(df,           "C:/Users/HP/Documents/Cow_control_project/cowcontrol_pipeline/cowcontrol/data/outputs/tables/testday_clean_long.csv")
+fwrite(lact_summary, "outputs/tables/lactation_summary.csv")
+fwrite(n_flagged,    "outputs/tables/data_quality_flags_summary.csv")
